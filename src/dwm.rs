@@ -1,0 +1,771 @@
+use crate::style::BackgroundMode;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+#[cfg(windows)]
+use std::ffi::c_void;
+
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{HWND, POINT, RECT},
+    Graphics::{
+        Dwm::{
+            DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND, DWM_SYSTEMBACKDROP_TYPE, DWMSBT_NONE,
+            DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
+            DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+            DwmEnableBlurBehindWindow, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+        },
+        Gdi::{
+            CreateRectRgn, DeleteObject, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST,
+            MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
+        },
+    },
+    System::{
+        Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
+        Threading::{GetCurrentProcess, GetCurrentProcessId, SetProcessWorkingSetSize},
+    },
+    UI::{
+        Controls::{
+            MARGINS, SetWindowThemeAttribute, WTA_NONCLIENT, WTA_OPTIONS, WTNCA_NODRAWCAPTION,
+            WTNCA_NODRAWICON, WTNCA_NOMIRRORHELP, WTNCA_NOSYSMENU,
+        },
+        WindowsAndMessaging::{
+            FindWindowExW, GWL_EXSTYLE, GWL_STYLE, GetCursorPos, GetSystemMetrics,
+            GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, SM_CXSCREEN,
+            SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
+            SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+            WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+        },
+    },
+};
+
+// DWMWA_COLOR_DEFAULT = 0xFFFFFFFF restores the default Windows 11 1px system border
+#[cfg(windows)]
+const DWMWA_COLOR_DEFAULT: u32 = 0xFFFFFFFF;
+
+pub fn extract_hwnd(window: &(impl HasWindowHandle + ?Sized)) -> Option<isize> {
+    let handle = window.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+        _ => None,
+    }
+}
+
+/// Queries the Windows Registry (`HKCU\...\Personalize\AppsUseLightTheme`) to detect Windows Light vs Dark mode.
+pub fn is_windows_light_theme() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        let subkey: Vec<u16> =
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+                .encode_utf16()
+                .collect();
+        let value_name: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+        let mut data: u32 = 0;
+        let mut size: u32 = std::mem::size_of::<u32>() as u32;
+        let status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value_name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            &mut data as *mut u32 as *mut c_void,
+            &mut size,
+        );
+        if status == 0 {
+            return data != 0;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+const CAPTION_CONTROLS_STRIP_MASK: isize = (WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX) as isize;
+
+/// Returns `true` if Windows caption control style bits (`WS_SYSMENU`, `WS_MINIMIZEBOX`, `WS_MAXIMIZEBOX`)
+/// are currently present on the HWND and need to be stripped again.
+pub fn needs_caption_suppression(hwnd_raw: Option<isize>) -> bool {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            return (style & CAPTION_CONTROLS_STRIP_MASK) != 0;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+    false
+}
+
+/// Suppresses the Windows caption bar, icon, and Minimize/Maximize/Close (`—`, `□`, `✕`) buttons on the HWND.
+/// Returns `true` if `GWL_STYLE` was modified.
+#[cfg(windows)]
+unsafe fn suppress_window_caption_controls(hwnd: HWND) -> bool {
+    unsafe {
+        // 1. Tell UxTheme never to draw caption text, system icon, or caption buttons
+        let flags = WTNCA_NODRAWCAPTION | WTNCA_NODRAWICON | WTNCA_NOSYSMENU | WTNCA_NOMIRRORHELP;
+        let opts = WTA_OPTIONS {
+            dwFlags: flags,
+            dwMask: flags,
+        };
+        let _ = SetWindowThemeAttribute(
+            hwnd,
+            WTA_NONCLIENT,
+            &opts as *const WTA_OPTIONS as *const c_void,
+            std::mem::size_of::<WTA_OPTIONS>() as u32,
+        );
+
+        // 2. Strip WS_SYSMENU, WS_MINIMIZEBOX, and WS_MAXIMIZEBOX from GWL_STYLE so DWM has no caption buttons to render
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let new_style = style & !CAPTION_CONTROLS_STRIP_MASK;
+        if new_style != style {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
+            let _ = SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+            return true;
+        }
+        false
+    }
+}
+
+/// Enables WGL OpenGL per-pixel alpha transparency and applies/removes Windows 11 Frosted Glass blur.
+pub fn sync_window_blur(hwnd_raw: Option<isize>, mode: BackgroundMode, is_light: bool) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            // 1. Remove Windows caption buttons (`—`, `□`, `✕`) so they never appear in any mode
+            let stripped_style = suppress_window_caption_controls(hwnd);
+
+            // 2. Sync dark/light mode for DWM Acrylic backdrop recipe
+            let dark_mode: u32 = if is_light { 0 } else { 1 };
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                &dark_mode as *const u32 as *const _,
+                std::mem::size_of::<u32>() as u32,
+            );
+
+            let default_border: u32 = DWMWA_COLOR_DEFAULT;
+
+            match mode {
+                BackgroundMode::FrostedGlass => {
+                    // Extend frame into client area ONLY in FrostedGlass mode so Windows 11 Acrylic backdrop renders
+                    let margins = MARGINS {
+                        cxLeftWidth: -1,
+                        cxRightWidth: -1,
+                        cyTopHeight: -1,
+                        cyBottomHeight: -1,
+                    };
+                    let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+                    let corner_pref: u32 = DWMWCP_ROUND as u32;
+                    let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                        &corner_pref as *const u32 as *const _,
+                        std::mem::size_of::<u32>() as u32,
+                    );
+
+                    // Enable Windows 11 transient Acrylic frosted glass backdrop
+                    let backdrop_acrylic: DWM_SYSTEMBACKDROP_TYPE = DWMSBT_TRANSIENTWINDOW;
+                    let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_SYSTEMBACKDROP_TYPE as u32,
+                        &backdrop_acrylic as *const _ as *const _,
+                        std::mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
+                    );
+                }
+                BackgroundMode::Transparent => {
+                    // Disable system backdrop blur completely
+                    let backdrop_none: DWM_SYSTEMBACKDROP_TYPE = DWMSBT_NONE;
+                    let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_SYSTEMBACKDROP_TYPE as u32,
+                        &backdrop_none as *const _ as *const _,
+                        std::mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
+                    );
+
+                    // CRITICAL: Use 0 margins in Transparent/Compact mode so DWM does NOT draw its
+                    // dark non-client frame gradient or outer drop shadow behind the transparent text!
+                    let zero_margins = MARGINS {
+                        cxLeftWidth: 0,
+                        cxRightWidth: 0,
+                        cyTopHeight: 0,
+                        cyBottomHeight: 0,
+                    };
+                    let _ = DwmExtendFrameIntoClientArea(hwnd, &zero_margins);
+
+                    let corner_pref: u32 = DWMWCP_DONOTROUND as u32;
+                    let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                        &corner_pref as *const u32 as *const _,
+                        std::mem::size_of::<u32>() as u32,
+                    );
+                }
+            }
+
+            // Use the default Windows 11 1px system border
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR as u32,
+                &default_border as *const u32 as *const _,
+                std::mem::size_of::<u32>() as u32,
+            );
+
+            // 3. Always enable per-pixel alpha composition with an empty 0-pixel blur region `CreateRectRgn(0, 0, -1, -1)`
+            // AFTER configuring margins/backdrop so WGL OpenGL (`glow`) alpha=0 pixels are 100% transparent.
+            let empty_rgn = CreateRectRgn(0, 0, -1, -1);
+            let bb = DWM_BLURBEHIND {
+                dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+                fEnable: 1,
+                hRgnBlur: empty_rgn,
+                fTransitionOnMaximized: 0,
+            };
+            let _ = DwmEnableBlurBehindWindow(hwnd, &bb);
+            if !empty_rgn.is_null() {
+                let _ = DeleteObject(empty_rgn as _);
+            }
+
+            if stripped_style {
+                let _ = SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (hwnd_raw, mode, is_light);
+}
+
+/// Resizes the window to the exact physical dimensions `(width_px, height_px)` without moving its top-left corner.
+pub fn resize_window_px(hwnd_raw: Option<isize>, width_px: i32, height_px: i32) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                width_px,
+                height_px,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (hwnd_raw, width_px, height_px);
+}
+
+/// Reads the current physical screen position `(left, top)` of the window directly via Win32 `GetWindowRect`.
+pub fn get_window_pos_px(hwnd_raw: Option<isize>) -> Option<[i32; 2]> {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if GetWindowRect(hwnd, &mut rect) != 0 && rect.left > -15000 && rect.top > -15000 {
+                return Some([rect.left, rect.top]);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+    None
+}
+
+/// Checks if a given physical screen position `(x, y)` is visible on any connected monitor.
+pub fn is_pos_on_any_monitor(x: i32, y: i32, width_px: i32, height_px: i32) -> bool {
+    #[cfg(windows)]
+    unsafe {
+        let check_pt = POINT {
+            x: x + (width_px / 2).max(40),
+            y: y + (height_px / 2).max(40),
+        };
+        let hmon = MonitorFromPoint(check_pt, MONITOR_DEFAULTTONULL);
+        !hmon.is_null()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (x, y, width_px, height_px);
+        true
+    }
+}
+
+/// Returns the centered physical `(x, y)` coordinates on the primary monitor.
+pub fn primary_monitor_center_pos_px(width_px: i32, height_px: i32) -> [i32; 2] {
+    #[cfg(windows)]
+    unsafe {
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+        if screen_w > width_px && screen_h > height_px {
+            return [
+                (screen_w - width_px) / 2,
+                ((screen_h - height_px) as f32 * 0.35) as i32,
+            ];
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (width_px, height_px);
+    [240, 180]
+}
+
+/// Moves the window to the exact physical screen coordinates `(x, y)`, or centers it on the primary monitor if off-screen.
+pub fn set_window_pos_px_checked(
+    hwnd_raw: Option<isize>,
+    saved_pos: Option<[i32; 2]>,
+    width_px: i32,
+    height_px: i32,
+) -> [i32; 2] {
+    let target = match saved_pos {
+        Some([x, y]) if is_pos_on_any_monitor(x, y, width_px, height_px) => [x, y],
+        _ => primary_monitor_center_pos_px(width_px, height_px),
+    };
+
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                target[0],
+                target[1],
+                width_px,
+                height_px,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+
+    target
+}
+
+/// Brings the HWND to the foreground.
+pub fn bring_hwnd_to_front(hwnd_raw: Option<isize>) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+}
+
+/// Returns the current physical screen cursor position `(x, y)`.
+pub fn get_cursor_pos_px() -> Option<[i32; 2]> {
+    #[cfg(windows)]
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut pt) != 0 {
+            return Some([pt.x, pt.y]);
+        }
+    }
+    None
+}
+
+/// Places a popup rectangle of `size` near `anchor` inside `[work_min, work_max]` with `margin`,
+/// flipping across the anchor when it would overflow the right or bottom work-area edge.
+pub fn clamp_rect_to_work_area(
+    anchor: [i32; 2],
+    size: [i32; 2],
+    work_min: [i32; 2],
+    work_max: [i32; 2],
+    margin: i32,
+) -> [i32; 2] {
+    let place_axis = |pos: i32, len: i32, min_edge: i32, max_edge: i32| -> i32 {
+        if pos + len + margin <= max_edge {
+            pos.max(min_edge + margin)
+        } else if pos - len >= min_edge + margin {
+            pos - len
+        } else {
+            let lo = min_edge + margin;
+            let hi = (max_edge - len - margin).max(lo);
+            pos.clamp(lo, hi)
+        }
+    };
+
+    [
+        place_axis(anchor[0], size[0], work_min[0], work_max[0]),
+        place_axis(anchor[1], size[1], work_min[1], work_max[1]),
+    ]
+}
+
+/// Clamps a popup window position to the nearest monitor's work area in physical pixels.
+pub fn clamp_popup_pos_to_monitor_px(
+    anchor_px: [i32; 2],
+    width_px: i32,
+    height_px: i32,
+) -> [i32; 2] {
+    #[cfg(windows)]
+    unsafe {
+        let pt = POINT {
+            x: anchor_px[0],
+            y: anchor_px[1],
+        };
+        let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        if !hmon.is_null() {
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                rcMonitor: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                rcWork: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                dwFlags: 0,
+            };
+            if GetMonitorInfoW(hmon, &mut info) != 0 {
+                return clamp_rect_to_work_area(
+                    anchor_px,
+                    [width_px, height_px],
+                    [info.rcWork.left, info.rcWork.top],
+                    [info.rcWork.right, info.rcWork.bottom],
+                    6,
+                );
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (width_px, height_px);
+    anchor_px
+}
+
+/// Finds a top-level window belonging to the current process by its exact title.
+pub fn find_own_window_by_title(title: &str) -> Option<isize> {
+    #[cfg(windows)]
+    unsafe {
+        let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let current_pid = GetCurrentProcessId();
+        let mut prev: HWND = std::ptr::null_mut();
+        loop {
+            let hwnd = FindWindowExW(
+                std::ptr::null_mut(),
+                prev,
+                std::ptr::null(),
+                wide_title.as_ptr(),
+            );
+            if hwnd.is_null() {
+                break;
+            }
+            let mut pid: u32 = 0;
+            let _ = GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == current_pid {
+                return Some(hwnd as isize);
+            }
+            prev = hwnd;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = title;
+    None
+}
+
+/// Returns `[left, top, right, bottom]` of the target monitor's work area in physical pixels.
+pub fn get_monitor_work_area_for_hwnd(
+    hwnd_raw: Option<isize>,
+    fallback_pos_px: Option<[i32; 2]>,
+) -> [i32; 4] {
+    #[cfg(windows)]
+    unsafe {
+        let hmon = if let Some(raw) = hwnd_raw {
+            MonitorFromWindow(raw as HWND, MONITOR_DEFAULTTONEAREST)
+        } else if let Some([x, y]) = fallback_pos_px {
+            MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST)
+        } else {
+            MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTONEAREST)
+        };
+
+        if !hmon.is_null() {
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                rcMonitor: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                rcWork: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                dwFlags: 0,
+            };
+            if GetMonitorInfoW(hmon, &mut info) != 0 {
+                return [
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                ];
+            }
+        }
+
+        let screen_w = GetSystemMetrics(SM_CXSCREEN).max(800);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN).max(600);
+        [0, 0, screen_w, screen_h]
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (hwnd_raw, fallback_pos_px);
+        [0, 0, 1920, 1080]
+    }
+}
+
+/// Resolves a window position inside `work_rect` (`[left, top, right, bottom]`), restoring `saved_pos`
+/// if its center lies within `work_rect` (clamped to stay inside), or centering inside `work_rect`.
+pub fn resolve_window_pos_in_work_area(
+    saved_pos: Option<[i32; 2]>,
+    size: [i32; 2],
+    work_rect: [i32; 4],
+) -> [i32; 2] {
+    let [left, top, right, bottom] = work_rect;
+    let max_x = (right - size[0]).max(left);
+    let max_y = (bottom - size[1]).max(top);
+
+    if let Some([x, y]) = saved_pos {
+        let cx = x + size[0] / 2;
+        let cy = y + size[1] / 2;
+        if cx >= left && cx < right && cy >= top && cy < bottom {
+            return [x.clamp(left, max_x), y.clamp(top, max_y)];
+        }
+    }
+
+    let x = (left + (right - left - size[0]) / 2).clamp(left, max_x);
+    let y = (top + (bottom - top - size[1]) / 2).clamp(top, max_y);
+    [x, y]
+}
+
+/// Disables Windows DWM open/close/restore transitions for a frameless window
+/// while keeping normal taskbar and Alt-Tab visibility.
+pub fn configure_frameless_window(hwnd_raw: Option<isize>) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let disable_transitions: u32 = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+                &disable_transitions as *const u32 as *const _,
+                std::mem::size_of::<u32>() as u32,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+}
+
+/// Disables Windows DWM open/close/restore transitions for the frameless Settings window
+/// while keeping normal taskbar and Alt-Tab visibility.
+pub fn configure_settings_window(hwnd_raw: Option<isize>) {
+    configure_frameless_window(hwnd_raw);
+}
+
+/// Disables Windows DWM open/close/restore transitions and configures tool-window extended style for popups.
+pub fn configure_popup_window(hwnd_raw: Option<isize>) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let disable_transitions: u32 = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+                &disable_transitions as *const u32 as *const _,
+                std::mem::size_of::<u32>() as u32,
+            );
+
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let new_ex_style = (ex_style | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
+            if new_ex_style != ex_style {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex_style);
+                let _ = SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+}
+
+/// Positions a native topmost popup window at exact physical screen coordinates,
+/// optionally showing and focusing it without invoking `SW_RESTORE` transition animations.
+pub fn position_popup_window_px(
+    hwnd_raw: Option<isize>,
+    x_px: i32,
+    y_px: i32,
+    width_px: i32,
+    height_px: i32,
+    show: bool,
+) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let flags = if show { SWP_SHOWWINDOW } else { SWP_NOACTIVATE };
+            let _ = SetWindowPos(hwnd, HWND_TOPMOST, x_px, y_px, width_px, height_px, flags);
+            if show {
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (hwnd_raw, x_px, y_px, width_px, height_px, show);
+}
+
+/// Hides a native popup window cleanly before viewport teardown.
+pub fn hide_popup_window(hwnd_raw: Option<isize>) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+}
+
+/// Instructs Windows to reclaim unused startup, OpenGL shader compiler, and transient HTTP/TLS pages from the working set.
+pub fn trim_process_working_set() {
+    #[cfg(windows)]
+    unsafe {
+        let proc = GetCurrentProcess();
+        let _ = SetProcessWorkingSetSize(proc, usize::MAX, usize::MAX);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_rect_to_work_area, resolve_window_pos_in_work_area};
+
+    #[test]
+    fn test_resolve_window_pos_in_work_area() {
+        let primary = [0, 0, 1920, 1040];
+        let right_monitor = [1920, 0, 3840, 1040];
+        let left_monitor = [-1920, 0, 0, 1040];
+        let size = [468, 564];
+
+        // Default centering on primary and secondary monitors
+        assert_eq!(
+            resolve_window_pos_in_work_area(None, size, primary),
+            [(1920 - 468) / 2, (1040 - 564) / 2]
+        );
+        assert_eq!(
+            resolve_window_pos_in_work_area(None, size, right_monitor),
+            [1920 + (1920 - 468) / 2, (1040 - 564) / 2]
+        );
+        assert_eq!(
+            resolve_window_pos_in_work_area(None, size, left_monitor),
+            [-1920 + (1920 - 468) / 2, (1040 - 564) / 2]
+        );
+
+        // Exact restoration on the same monitor (including flush-edge parked position)
+        assert_eq!(
+            resolve_window_pos_in_work_area(Some([1920, 0]), size, right_monitor),
+            [1920, 0]
+        );
+        assert_eq!(
+            resolve_window_pos_in_work_area(Some([2100, 180]), size, right_monitor),
+            [2100, 180]
+        );
+
+        // Clamping saved position on the same monitor when partially overflowing right/bottom edge
+        assert_eq!(
+            resolve_window_pos_in_work_area(Some([3600, 750]), size, right_monitor),
+            [3840 - 468, 1040 - 564]
+        );
+
+        // Re-centering onto widget's current monitor when saved position belongs to another monitor
+        assert_eq!(
+            resolve_window_pos_in_work_area(Some([200, 180]), size, right_monitor),
+            [1920 + (1920 - 468) / 2, (1040 - 564) / 2]
+        );
+        assert_eq!(
+            resolve_window_pos_in_work_area(Some([2400, 180]), size, left_monitor),
+            [-1920 + (1920 - 468) / 2, (1040 - 564) / 2]
+        );
+
+        // Small monitor where work area is smaller than window clamps safely to [left, top]
+        assert_eq!(
+            resolve_window_pos_in_work_area(None, [468, 564], [100, 50, 500, 450]),
+            [100, 50]
+        );
+    }
+
+    #[test]
+    fn test_clamp_rect_to_work_area() {
+        // Normal placement with room to the right and bottom
+        assert_eq!(
+            clamp_rect_to_work_area([100, 120], [236, 160], [0, 0], [1920, 1040], 6),
+            [100, 120]
+        );
+
+        // Right-edge overflow flips left of anchor
+        assert_eq!(
+            clamp_rect_to_work_area([1850, 120], [236, 160], [0, 0], [1920, 1040], 6),
+            [1614, 120]
+        );
+
+        // Bottom-edge overflow flips above anchor
+        assert_eq!(
+            clamp_rect_to_work_area([100, 980], [236, 160], [0, 0], [1920, 1040], 6),
+            [100, 820]
+        );
+
+        // Multi-monitor high-offset work area
+        assert_eq!(
+            clamp_rect_to_work_area([5700, 1000], [236, 160], [3840, 0], [5760, 1040], 6),
+            [5464, 840]
+        );
+
+        // Tight corner where neither right nor left fits cleanly clamps inside work area
+        assert_eq!(
+            clamp_rect_to_work_area([120, 80], [236, 160], [0, 0], [300, 200], 6),
+            [58, 34]
+        );
+    }
+}

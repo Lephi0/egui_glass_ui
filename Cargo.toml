@@ -1,0 +1,29 @@
+[package]
+name = "egui_glass_ui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Windows 11 DWM Acrylic glass surfaces, frameless window helpers, and translucent egui UI components"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
+[dependencies]
+egui = { version = "0.31", default-features = false }
+raw-window-handle = "0.6"
+serde = { version = "1.0", default-features = false, features = ["derive", "std"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
