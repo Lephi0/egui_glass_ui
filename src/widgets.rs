@@ -1,43 +1,15 @@
 use crate::style::GlassPalette;
 use egui::{
-    Align2, Color32, Context, CornerRadius, CursorIcon, FontData, FontDefinitions, FontFamily,
-    FontId, Frame, Id, Margin, Painter, PointerButton, Pos2, Rect, RichText, Sense, Stroke, Ui,
-    Vec2, ViewportCommand,
+    Align2, Color32, Context, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Id, Key,
+    Margin, Painter, PointerButton, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2,
+    ViewportCommand,
 };
 use std::hash::Hash;
-use std::ops::RangeInclusive;
-use std::sync::Arc;
+use std::ops::{Range, RangeInclusive};
 
 pub const GLASS_TITLEBAR_HEIGHT: f32 = 46.0;
 
-/// Installs a standard Windows UI sans-serif font (`Segoe UI`, `Arial`, or `Tahoma`) into egui.
-pub fn install_system_font(ctx: &Context) {
-    let candidates = [
-        r"C:\Windows\Fonts\segoeui.ttf",
-        r"C:\Windows\Fonts\arial.ttf",
-        r"C:\Windows\Fonts\tahoma.ttf",
-    ];
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = FontDefinitions::empty();
-            fonts
-                .font_data
-                .insert("sys_ui".to_owned(), Arc::new(FontData::from_owned(bytes)));
-            fonts
-                .families
-                .entry(FontFamily::Proportional)
-                .or_default()
-                .push("sys_ui".to_owned());
-            fonts
-                .families
-                .entry(FontFamily::Monospace)
-                .or_default()
-                .push("sys_ui".to_owned());
-            ctx.set_fonts(fonts);
-            return;
-        }
-    }
-}
+pub use crate::fonts::install_system_font;
 
 /// Renders crisp text with an optional multi-pass soft drop shadow for legibility in Clear and Glass modes.
 pub fn draw_shadowed_text(
@@ -685,6 +657,303 @@ pub fn glass_list_row(
     .inner
 }
 
+/// Action returned by [`glass_keybind_row`] in a single frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeybindRowAction {
+    None,
+    Apply(String),
+    ToggleRecord,
+    Reset,
+}
+
+/// Smoothly animates a hover-revealed toolbar or overlay opacity (`0.0..=1.0`).
+pub fn hover_chrome_opacity(ctx: &Context, id: Id, visible: bool) -> f32 {
+    ctx.animate_bool_with_time(id, visible, 0.14)
+}
+
+/// Renders a backgroundless icon button that reveals a darker rounded fill only on hover/press,
+/// with opacity scaled by `alpha` (e.g. for hover chrome).
+pub fn glass_icon_button(
+    ui: &mut Ui,
+    id_salt: impl Hash,
+    palette: &GlassPalette,
+    size: f32,
+    active: bool,
+    alpha: f32,
+    tooltip: &str,
+    draw_icon: impl FnOnce(&Painter, Pos2, Color32),
+) -> egui::Response {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let resp = ui
+        .push_id(id_salt, |ui| {
+            let sense = if alpha > 0.04 {
+                Sense::click()
+            } else {
+                Sense::hover()
+            };
+            let (rect, mut resp) = ui.allocate_exact_size(Vec2::splat(size), sense);
+            if alpha > 0.04 {
+                resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+            }
+
+            if alpha > 0.01 {
+                let hovered = alpha > 0.04 && resp.hovered();
+                let pressed = hovered && resp.is_pointer_button_down_on();
+                let painter = ui.painter();
+
+                if pressed {
+                    painter.rect_filled(
+                        rect,
+                        CornerRadius::same(8),
+                        palette.icon_button_pressed_fill.gamma_multiply(alpha),
+                    );
+                } else if hovered {
+                    painter.rect_filled(
+                        rect,
+                        CornerRadius::same(8),
+                        palette.icon_button_hover_fill.gamma_multiply(alpha),
+                    );
+                }
+
+                let icon_color = if active {
+                    if hovered {
+                        palette.accent_hover_fill
+                    } else {
+                        palette.accent_fill
+                    }
+                } else if hovered {
+                    palette.primary_text
+                } else {
+                    palette.secondary_text
+                }
+                .gamma_multiply(alpha);
+
+                draw_icon(painter, rect.center(), icon_color);
+            }
+            resp
+        })
+        .inner;
+
+    if alpha > 0.5 && !tooltip.is_empty() {
+        resp.on_hover_text(tooltip)
+    } else {
+        resp
+    }
+}
+
+/// Computes the slice of pagination indices to display when `count` exceeds `max_visible`.
+pub fn visible_dot_window(count: usize, active_index: usize, max_visible: usize) -> Range<usize> {
+    if count <= max_visible || max_visible == 0 {
+        return 0..count;
+    }
+    let clamped_active = active_index.min(count.saturating_sub(1));
+    let half = max_visible / 2;
+    let start = clamped_active
+        .saturating_sub(half)
+        .min(count - max_visible);
+    start..(start + max_visible)
+}
+
+/// Renders horizontal pill/dot pagination indicators. Returns `Some(index)` when a dot is clicked.
+pub fn glass_pagination_dots(
+    ui: &mut Ui,
+    id_salt: impl Hash,
+    palette: &GlassPalette,
+    count: usize,
+    active_index: usize,
+    alpha: f32,
+) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let alpha = alpha.clamp(0.0, 1.0);
+    let range = visible_dot_window(count, active_index, 11);
+    let mut clicked = None;
+    ui.push_id(id_salt, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            let sense = if alpha > 0.04 {
+                Sense::click()
+            } else {
+                Sense::hover()
+            };
+            for idx in range {
+                let is_active = idx == active_index;
+                let dot_w = if is_active { 16.0 } else { 6.0 };
+                let hit_size = Vec2::new(dot_w + 4.0, 14.0);
+                let (hit_rect, mut resp) = ui.allocate_exact_size(hit_size, sense);
+                if alpha > 0.04 {
+                    resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+                }
+                if alpha > 0.01 {
+                    let visual_rect =
+                        Rect::from_center_size(hit_rect.center(), Vec2::new(dot_w, 6.0));
+                    let color = if is_active {
+                        palette.accent_fill
+                    } else if alpha > 0.04 && resp.hovered() {
+                        palette.primary_text
+                    } else {
+                        palette.muted_text.gamma_multiply(0.75)
+                    }
+                    .gamma_multiply(alpha);
+                    ui.painter()
+                        .rect_filled(visual_rect, CornerRadius::same(3), color);
+                }
+                if alpha > 0.04 && resp.clicked() {
+                    clicked = Some(idx);
+                }
+            }
+        });
+    });
+
+    clicked
+}
+
+/// Renders a clickable glass card for zoomed-out grid overviews, clipping contents to its inner rect.
+pub fn glass_grid_card(
+    ui: &mut Ui,
+    id_salt: impl Hash,
+    palette: &GlassPalette,
+    size: Vec2,
+    selected: bool,
+    add_contents: impl FnOnce(&mut Ui, Rect, bool),
+) -> egui::Response {
+    let id = ui.make_persistent_id(id_salt);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    let hovered = resp.hovered();
+
+    let fill = if selected {
+        palette.control_hover_fill
+    } else if hovered {
+        palette.control_hover_fill
+    } else {
+        palette.card_fill
+    };
+    let stroke = if selected {
+        Stroke::new(1.5_f32, palette.accent_fill)
+    } else if hovered {
+        Stroke::new(1.2_f32, palette.accent_fill.gamma_multiply(0.72))
+    } else {
+        Stroke::new(1.0_f32, palette.card_stroke)
+    };
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(11), fill);
+    painter.rect_stroke(rect, CornerRadius::same(11), stroke, egui::StrokeKind::Inside);
+
+    let inner = rect.shrink2(Vec2::new(12.0, 10.0));
+    let mut child_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(id.with("body"))
+            .max_rect(inner),
+    );
+    child_ui.set_clip_rect(inner);
+    add_contents(&mut child_ui, inner, hovered);
+
+    resp
+}
+
+/// Renders a reusable shortcut-editing row with a text field, Apply button, Record toggle, and Reset button.
+pub fn glass_keybind_row(
+    ui: &mut Ui,
+    id_salt: impl Hash,
+    palette: &GlassPalette,
+    label: &str,
+    subtitle: Option<&str>,
+    buf: &mut String,
+    is_recording: bool,
+    default_val: &str,
+) -> KeybindRowAction {
+    let mut action = KeybindRowAction::None;
+    ui.push_id(id_salt, |ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(
+                        RichText::new(label)
+                            .size(12.5)
+                            .color(palette.primary_text),
+                    );
+                    if let Some(sub) = subtitle {
+                        ui.label(RichText::new(sub).size(10.5).color(palette.muted_text));
+                    }
+                });
+            });
+
+            ui.horizontal(|ui| {
+                let edit_w = (ui.available_width() - 186.0).max(96.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(buf)
+                        .desired_width(edit_w)
+                        .hint_text(default_val),
+                );
+                let enter_apply = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                if enter_apply || glass_button(ui, palette, "Apply").clicked() {
+                    action = KeybindRowAction::Apply(buf.trim().to_string());
+                }
+
+                let rec_clicked = if is_recording {
+                    glass_danger_button(ui, palette, "Press... (Esc)").clicked()
+                } else {
+                    glass_button(ui, palette, "Record").clicked()
+                };
+                if rec_clicked {
+                    action = KeybindRowAction::ToggleRecord;
+                }
+
+                let is_default = buf.trim().eq_ignore_ascii_case(default_val);
+                if !is_default && glass_button(ui, palette, "Reset").clicked() {
+                    action = KeybindRowAction::Reset;
+                }
+            });
+        });
+    });
+    action
+}
+
+/// Renders a floating translucent toast pill centered on `anchor_center` scaled by `alpha`.
+pub fn glass_toast_pill(
+    painter: &Painter,
+    anchor_center: Pos2,
+    palette: &GlassPalette,
+    text: &str,
+    alpha: f32,
+) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.01 || text.is_empty() {
+        return;
+    }
+    let font = FontId::new(11.5, FontFamily::Proportional);
+    let galley = painter.layout_no_wrap(text.to_string(), font, palette.primary_text);
+    let size = galley.size() + Vec2::new(22.0, 12.0);
+    let rect = Rect::from_center_size(anchor_center, size);
+    let bg = if palette.is_light {
+        Color32::from_rgba_unmultiplied(245, 248, 255, 232)
+    } else {
+        Color32::from_rgba_unmultiplied(22, 26, 36, 232)
+    }
+    .gamma_multiply(alpha);
+
+    painter.rect_filled(rect, CornerRadius::same(12), bg);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(12),
+        Stroke::new(1.0_f32, palette.control_stroke.gamma_multiply(alpha)),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(
+        Pos2::new(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        palette.primary_text.gamma_multiply(alpha),
+    );
+}
+
 fn lerp_color32(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp_u8 = |c0: u8, c1: u8| -> u8 {
@@ -698,4 +967,17 @@ fn lerp_color32(a: Color32, b: Color32, t: f32) -> Color32 {
         lerp_u8(a.b(), b.b()),
         lerp_u8(a.a(), b.a()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_dot_window;
+
+    #[test]
+    fn test_visible_dot_window() {
+        assert_eq!(visible_dot_window(5, 2, 11), 0..5);
+        assert_eq!(visible_dot_window(20, 0, 11), 0..11);
+        assert_eq!(visible_dot_window(20, 10, 11), 5..16);
+        assert_eq!(visible_dot_window(20, 19, 11), 9..20);
+    }
 }

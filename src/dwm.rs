@@ -8,33 +8,42 @@ use windows_sys::Win32::{
     Foundation::{HWND, POINT, RECT},
     Graphics::{
         Dwm::{
-            DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND, DWM_SYSTEMBACKDROP_TYPE, DWMSBT_NONE,
-            DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
+            DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND, DWM_SYSTEMBACKDROP_TYPE, DWMWA_CLOAK,
+            DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
             DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
             DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
             DwmEnableBlurBehindWindow, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
         },
         Gdi::{
-            CreateRectRgn, DeleteObject, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST,
-            MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
+            CreateRectRgn, DeleteObject, GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST,
+            MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+            MonitorFromWindow,
         },
     },
     System::{
         Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
-        Threading::{GetCurrentProcess, GetCurrentProcessId, SetProcessWorkingSetSize},
+        Threading::{
+            AttachThreadInput, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
+            SetProcessWorkingSetSize,
+        },
     },
     UI::{
         Controls::{
             MARGINS, SetWindowThemeAttribute, WTA_NONCLIENT, WTA_OPTIONS, WTNCA_NODRAWCAPTION,
             WTNCA_NODRAWICON, WTNCA_NOMIRRORHELP, WTNCA_NOSYSMENU,
         },
+        Input::KeyboardAndMouse::{
+            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+            KEYEVENTF_KEYUP, SendInput, SetActiveWindow, SetFocus, VK_LWIN, VK_MENU, VK_RWIN,
+        },
         WindowsAndMessaging::{
-            FindWindowExW, GWL_EXSTYLE, GWL_STYLE, GetCursorPos, GetSystemMetrics,
-            GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, SM_CXSCREEN,
-            SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
-            SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-            WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+            BringWindowToTop, FindWindowExW, GWL_EXSTYLE, GWL_STYLE, GetCursorPos,
+            GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
+            GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible, SM_CXSCREEN,
+            SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+            SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, ShowWindowAsync,
+            WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
         },
     },
 };
@@ -494,21 +503,9 @@ pub fn find_own_window_by_title(title: &str) -> Option<isize> {
     None
 }
 
-/// Returns `[left, top, right, bottom]` of the target monitor's work area in physical pixels.
-pub fn get_monitor_work_area_for_hwnd(
-    hwnd_raw: Option<isize>,
-    fallback_pos_px: Option<[i32; 2]>,
-) -> [i32; 4] {
-    #[cfg(windows)]
+#[cfg(windows)]
+unsafe fn work_area_from_hmon_or_fallback(hmon: HMONITOR) -> [i32; 4] {
     unsafe {
-        let hmon = if let Some(raw) = hwnd_raw {
-            MonitorFromWindow(raw as HWND, MONITOR_DEFAULTTONEAREST)
-        } else if let Some([x, y]) = fallback_pos_px {
-            MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST)
-        } else {
-            MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTONEAREST)
-        };
-
         if !hmon.is_null() {
             let mut info = MONITORINFO {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -540,11 +537,85 @@ pub fn get_monitor_work_area_for_hwnd(
         let screen_h = GetSystemMetrics(SM_CYSCREEN).max(600);
         [0, 0, screen_w, screen_h]
     }
+}
+
+/// Returns `[left, top, right, bottom]` of the target monitor's work area in physical pixels.
+pub fn get_monitor_work_area_for_hwnd(
+    hwnd_raw: Option<isize>,
+    fallback_pos_px: Option<[i32; 2]>,
+) -> [i32; 4] {
+    #[cfg(windows)]
+    unsafe {
+        let hmon = if let Some(raw) = hwnd_raw {
+            MonitorFromWindow(raw as HWND, MONITOR_DEFAULTTONEAREST)
+        } else if let Some([x, y]) = fallback_pos_px {
+            MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST)
+        } else {
+            MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)
+        };
+        work_area_from_hmon_or_fallback(hmon)
+    }
     #[cfg(not(windows))]
     {
         let _ = (hwnd_raw, fallback_pos_px);
         [0, 0, 1920, 1080]
     }
+}
+
+/// Returns `[left, top, right, bottom]` of the primary monitor's work area in physical pixels.
+pub fn get_primary_monitor_work_area_px() -> [i32; 4] {
+    #[cfg(windows)]
+    unsafe {
+        let hmon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        work_area_from_hmon_or_fallback(hmon)
+    }
+    #[cfg(not(windows))]
+    [0, 0, 1920, 1080]
+}
+
+/// Returns `[left, top, right, bottom]` of the monitor containing the mouse cursor (falling back to
+/// the foreground window's monitor, then the primary monitor) in physical pixels.
+pub fn get_cursor_monitor_work_area_px() -> [i32; 4] {
+    #[cfg(windows)]
+    unsafe {
+        let hmon = if let Some([cx, cy]) = get_cursor_pos_px() {
+            MonitorFromPoint(POINT { x: cx, y: cy }, MONITOR_DEFAULTTONEAREST)
+        } else {
+            let fg = GetForegroundWindow();
+            if !fg.is_null() {
+                MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST)
+            } else {
+                MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)
+            }
+        };
+        work_area_from_hmon_or_fallback(hmon)
+    }
+    #[cfg(not(windows))]
+    [0, 0, 1920, 1080]
+}
+
+/// Computes a centered `(pos_px, size_px)` overlay rectangle inside `work_rect` (`[left, top, right, bottom]`),
+/// scaled by `width_ratio` and `height_ratio` and clamped between `min_size_px` and the available work area.
+pub fn compute_overlay_rect_in_work_area(
+    work_rect: [i32; 4],
+    width_ratio: f32,
+    height_ratio: f32,
+    min_size_px: [i32; 2],
+    margin_px: i32,
+) -> ([i32; 2], [i32; 2]) {
+    let [left, top, right, bottom] = work_rect;
+    let work_w = (right - left).max(1);
+    let work_h = (bottom - top).max(1);
+    let max_w = (work_w - margin_px.max(0) * 2).max(200).min(work_w);
+    let max_h = (work_h - margin_px.max(0) * 2).max(200).min(work_h);
+
+    let desired_w = ((work_w as f32) * width_ratio).round() as i32;
+    let desired_h = ((work_h as f32) * height_ratio).round() as i32;
+    let size_w = desired_w.clamp(min_size_px[0].min(max_w), max_w);
+    let size_h = desired_h.clamp(min_size_px[1].min(max_h), max_h);
+    let size_px = [size_w, size_h];
+    let pos_px = resolve_window_pos_in_work_area(None, size_px, work_rect);
+    (pos_px, size_px)
 }
 
 /// Resolves a window position inside `work_rect` (`[left, top, right, bottom]`), restoring `saved_pos`
@@ -597,8 +668,9 @@ pub fn configure_settings_window(hwnd_raw: Option<isize>) {
     configure_frameless_window(hwnd_raw);
 }
 
-/// Disables Windows DWM open/close/restore transitions and configures tool-window extended style for popups.
-pub fn configure_popup_window(hwnd_raw: Option<isize>) {
+/// Disables Windows DWM open/close/restore transitions and configures tool-window extended style
+/// so a tray-only or popup window never shows on the taskbar or Alt-Tab switcher.
+pub fn configure_tray_only_window(hwnd_raw: Option<isize>) {
     #[cfg(windows)]
     if let Some(raw) = hwnd_raw {
         let hwnd = raw as HWND;
@@ -629,6 +701,11 @@ pub fn configure_popup_window(hwnd_raw: Option<isize>) {
     }
     #[cfg(not(windows))]
     let _ = hwnd_raw;
+}
+
+/// Disables Windows DWM open/close/restore transitions and configures tool-window extended style for popups.
+pub fn configure_popup_window(hwnd_raw: Option<isize>) {
+    configure_tray_only_window(hwnd_raw);
 }
 
 /// Positions a native topmost popup window at exact physical screen coordinates,
@@ -669,6 +746,267 @@ pub fn hide_popup_window(hwnd_raw: Option<isize>) {
     let _ = hwnd_raw;
 }
 
+/// Hides a native window to the background / system tray (`SW_HIDE`).
+pub fn hide_window(hwnd_raw: Option<isize>) {
+    hide_popup_window(hwnd_raw);
+}
+
+/// Cloaks or uncloaks a window via `DWMWA_CLOAK` so position/size transitions can settle while hidden from view.
+pub fn set_window_cloaked(hwnd_raw: Option<isize>, cloaked: bool) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let cloak: u32 = u32::from(cloaked);
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAK as u32,
+                &cloak as *const u32 as *const _,
+                std::mem::size_of::<u32>() as u32,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (hwnd_raw, cloaked);
+}
+
+/// Reveals a hidden window without DWM visual flash (cloaked) so its event loop can flush pending commands.
+pub fn wake_cloaked_window(hwnd_raw: Option<isize>) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        set_window_cloaked(Some(raw), true);
+        unsafe {
+            let _ = ShowWindowAsync(raw as HWND, SW_SHOWNOACTIVATE);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+}
+
+/// Repositions and resizes a window at physical screen coordinates without changing Z-order or activating.
+pub fn position_window_px_no_activate(hwnd_raw: Option<isize>, pos_px: [i32; 2], size_px: [i32; 2]) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        unsafe {
+            let _ = SetWindowPos(
+                raw as HWND,
+                std::ptr::null_mut(),
+                pos_px[0],
+                pos_px[1],
+                size_px[0],
+                size_px[1],
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (hwnd_raw, pos_px, size_px);
+}
+
+#[cfg(windows)]
+unsafe fn activate_hwnd_direct(hwnd: HWND) -> bool {
+    unsafe {
+        let _ = BringWindowToTop(hwnd);
+        let ok = SetForegroundWindow(hwnd) != 0 && GetForegroundWindow() == hwnd;
+        if ok {
+            let _ = SetActiveWindow(hwnd);
+            let _ = SetFocus(hwnd);
+        }
+        ok
+    }
+}
+
+#[cfg(windows)]
+unsafe fn send_alt_key_event(flags: u32) {
+    unsafe {
+        let input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_MENU,
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let _ = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(windows)]
+unsafe fn force_foreground_hwnd(hwnd: HWND) -> bool {
+    unsafe {
+        // Stage 1: Fast path (WM_HOTKEY, tray clicks, unlocked foreground)
+        if activate_hwnd_direct(hwnd) {
+            return true;
+        }
+
+        // Stage 2: AttachThreadInput path for same-integrity windows when summoned via WH_KEYBOARD_LL
+        let fg = GetForegroundWindow();
+        let cur_tid = GetCurrentThreadId();
+        let fg_tid = if !fg.is_null() && fg != hwnd {
+            GetWindowThreadProcessId(fg, std::ptr::null_mut())
+        } else {
+            0
+        };
+        let attached = fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(cur_tid, fg_tid, 1) != 0;
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetActiveWindow(hwnd);
+        let _ = SetFocus(hwnd);
+        if attached {
+            let _ = AttachThreadInput(cur_tid, fg_tid, 0);
+        }
+        if GetForegroundWindow() == hwnd {
+            return true;
+        }
+
+        // Stage 3: Paired VK_MENU fallback when Windows foreground lock blocked Stages 1 & 2
+        let alt_physically_down = GetAsyncKeyState(VK_MENU as i32) < 0;
+        if !alt_physically_down {
+            send_alt_key_event(KEYEVENTF_EXTENDEDKEY);
+        }
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetActiveWindow(hwnd);
+        let _ = SetFocus(hwnd);
+        if !alt_physically_down {
+            send_alt_key_event(KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP);
+        }
+
+        GetForegroundWindow() == hwnd
+    }
+}
+
+#[cfg(windows)]
+unsafe fn reveal_and_focus_hwnd(hwnd: HWND, always_on_top: bool) {
+    unsafe {
+        let cloak: u32 = 0;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK as u32,
+            &cloak as *const u32 as *const _,
+            std::mem::size_of::<u32>() as u32,
+        );
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+        );
+        if !always_on_top {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            );
+        }
+        let _ = force_foreground_hwnd(hwnd);
+    }
+}
+
+/// Shows a hidden or background window and focuses it without `SW_RESTORE` transition animations.
+pub fn show_window_to_front(hwnd_raw: Option<isize>, always_on_top: bool) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        unsafe {
+            reveal_and_focus_hwnd(raw as HWND, always_on_top);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (hwnd_raw, always_on_top);
+}
+
+/// Positions, shows, and focuses a window at exact physical screen coordinates without `SW_RESTORE` transitions.
+pub fn show_window_at_px(
+    hwnd_raw: Option<isize>,
+    pos_px: [i32; 2],
+    size_px: [i32; 2],
+    always_on_top: bool,
+) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                pos_px[0],
+                pos_px[1],
+                size_px[0],
+                size_px[1],
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            reveal_and_focus_hwnd(hwnd, always_on_top);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (hwnd_raw, pos_px, size_px, always_on_top);
+}
+
+/// Returns `true` when the native window currently has `WS_VISIBLE` set.
+pub fn is_window_visible(hwnd_raw: Option<isize>) -> bool {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        unsafe {
+            return IsWindowVisible(raw as HWND) != 0;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+    false
+}
+
+/// Returns the current OS foreground window handle (`HWND` as `isize`), if any.
+pub fn get_foreground_hwnd() -> Option<isize> {
+    #[cfg(windows)]
+    unsafe {
+        let fg = GetForegroundWindow();
+        return (!fg.is_null()).then_some(fg as isize);
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+/// Returns `true` when the native window is currently the OS foreground window.
+pub fn is_window_foreground(hwnd_raw: Option<isize>) -> bool {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        unsafe {
+            return GetForegroundWindow() == (raw as HWND);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+    false
+}
+
+/// Returns the true centered physical `(x, y)` coordinates inside the primary monitor's work area.
+pub fn center_on_primary_work_area_px(size_px: [i32; 2]) -> [i32; 2] {
+    let work_rect = get_monitor_work_area_for_hwnd(None, None);
+    resolve_window_pos_in_work_area(None, size_px, work_rect)
+}
+
+/// Returns `true` if either left or right Windows key is currently held down.
+pub fn is_win_key_pressed() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        return GetAsyncKeyState(VK_LWIN as i32) < 0 || GetAsyncKeyState(VK_RWIN as i32) < 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 /// Instructs Windows to reclaim unused startup, OpenGL shader compiler, and transient HTTP/TLS pages from the working set.
 pub fn trim_process_working_set() {
     #[cfg(windows)]
@@ -680,7 +1018,9 @@ pub fn trim_process_working_set() {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_rect_to_work_area, resolve_window_pos_in_work_area};
+    use super::{
+        clamp_rect_to_work_area, compute_overlay_rect_in_work_area, resolve_window_pos_in_work_area,
+    };
 
     #[test]
     fn test_resolve_window_pos_in_work_area() {
@@ -767,5 +1107,25 @@ mod tests {
             clamp_rect_to_work_area([120, 80], [236, 160], [0, 0], [300, 200], 6),
             [58, 34]
         );
+    }
+
+    #[test]
+    fn test_compute_overlay_rect_in_work_area() {
+        let (pos, size) =
+            compute_overlay_rect_in_work_area([0, 0, 1920, 1040], 0.72, 0.70, [680, 440], 24);
+        assert_eq!(size, [1382, 728]);
+        assert_eq!(pos, [(1920 - 1382) / 2, (1040 - 728) / 2]);
+
+        // Secondary monitor with negative x offset
+        let (pos_left, size_left) =
+            compute_overlay_rect_in_work_area([-1920, 0, 0, 1040], 0.72, 0.70, [680, 440], 24);
+        assert_eq!(size_left, [1382, 728]);
+        assert_eq!(pos_left, [-1920 + (1920 - 1382) / 2, (1040 - 728) / 2]);
+
+        // Small monitor respects margin and fits inside work area
+        let (pos_small, size_small) =
+            compute_overlay_rect_in_work_area([100, 50, 900, 650], 0.72, 0.70, [680, 440], 24);
+        assert_eq!(size_small, [680, 440]);
+        assert_eq!(pos_small, [100 + (800 - 680) / 2, 50 + (600 - 440) / 2]);
     }
 }

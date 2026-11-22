@@ -149,6 +149,8 @@ pub struct GlassPalette {
     pub control_fill: Color32,
     pub control_hover_fill: Color32,
     pub control_stroke: Color32,
+    pub icon_button_hover_fill: Color32,
+    pub icon_button_pressed_fill: Color32,
     pub input_fill: Color32,
     pub accent_fill: Color32,
     pub accent_hover_fill: Color32,
@@ -159,6 +161,11 @@ pub struct GlassPalette {
     pub segment_active_fill: Color32,
     pub toggle_off_fill: Color32,
     pub toggle_knob_fill: Color32,
+    pub code_bg: Color32,
+    pub syntax_muted: Color32,
+    pub link_text: Color32,
+    pub math_badge_fill: Color32,
+    pub math_badge_text: Color32,
 }
 
 impl GlassPalette {
@@ -181,6 +188,8 @@ impl GlassPalette {
                 control_fill: Color32::from_rgba_unmultiplied(24, 36, 58, 13),
                 control_hover_fill: Color32::from_rgba_unmultiplied(24, 36, 58, 24),
                 control_stroke: Color32::from_rgba_unmultiplied(20, 32, 56, 22),
+                icon_button_hover_fill: Color32::from_rgba_unmultiplied(18, 28, 46, 52),
+                icon_button_pressed_fill: Color32::from_rgba_unmultiplied(18, 28, 46, 78),
                 input_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 115),
                 accent_fill: Color32::from_rgb(36, 108, 232),
                 accent_hover_fill: Color32::from_rgb(28, 94, 214),
@@ -191,6 +200,11 @@ impl GlassPalette {
                 segment_active_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 128),
                 toggle_off_fill: Color32::from_rgba_unmultiplied(24, 36, 58, 38),
                 toggle_knob_fill: Color32::from_rgb(252, 253, 255),
+                code_bg: Color32::from_rgba_unmultiplied(20, 32, 56, 18),
+                syntax_muted: Color32::from_rgba_unmultiplied(90, 104, 128, 190),
+                link_text: Color32::from_rgb(26, 98, 216),
+                math_badge_fill: Color32::from_rgba_unmultiplied(36, 108, 232, 26),
+                math_badge_text: Color32::from_rgb(24, 88, 198),
             }
         } else {
             Self {
@@ -210,6 +224,8 @@ impl GlassPalette {
                 control_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 10),
                 control_hover_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 18),
                 control_stroke: Color32::from_rgba_unmultiplied(210, 220, 240, 14),
+                icon_button_hover_fill: Color32::from_rgba_unmultiplied(0, 0, 0, 102),
+                icon_button_pressed_fill: Color32::from_rgba_unmultiplied(0, 0, 0, 140),
                 input_fill: Color32::from_rgba_unmultiplied(8, 10, 16, 92),
                 accent_fill: Color32::from_rgb(66, 136, 248),
                 accent_hover_fill: Color32::from_rgb(86, 150, 252),
@@ -220,6 +236,11 @@ impl GlassPalette {
                 segment_active_fill: Color32::from_rgba_unmultiplied(210, 222, 245, 16),
                 toggle_off_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 26),
                 toggle_knob_fill: Color32::from_rgb(252, 253, 255),
+                code_bg: Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+                syntax_muted: Color32::from_rgba_unmultiplied(150, 164, 192, 165),
+                link_text: Color32::from_rgb(112, 176, 255),
+                math_badge_fill: Color32::from_rgba_unmultiplied(66, 136, 248, 38),
+                math_badge_text: Color32::from_rgb(154, 202, 255),
             }
         }
     }
@@ -412,6 +433,15 @@ mod tests {
         assert_ne!(light.segment_active_fill, dark.segment_active_fill);
         assert_ne!(light.selection_fill, dark.selection_fill);
         assert_ne!(light.success_text, dark.success_text);
+        assert_ne!(light.code_bg, dark.code_bg);
+        assert_ne!(light.syntax_muted, dark.syntax_muted);
+        assert_ne!(light.link_text, dark.link_text);
+        assert_ne!(light.math_badge_fill, dark.math_badge_fill);
+        assert_ne!(light.math_badge_text, dark.math_badge_text);
+        assert_ne!(light.icon_button_hover_fill, dark.icon_button_hover_fill);
+        assert_ne!(light.icon_button_pressed_fill, dark.icon_button_pressed_fill);
+        assert!(light.icon_button_pressed_fill.a() > light.icon_button_hover_fill.a());
+        assert!(dark.icon_button_pressed_fill.a() > dark.icon_button_hover_fill.a());
     }
 
     #[test]

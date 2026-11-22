@@ -4,23 +4,28 @@ Reusable Windows 11 DWM Acrylic glass view layer and translucent `egui` UI front
 
 ## Features
 
-- **Windows 11 DWM Acrylic & Transparent Composition (`dwm`, `style::GlassWindowBackdrop`)**:
+- **Windows 11 DWM Acrylic & Transparent Composition (`dwm`, `style::GlassWindowBackdrop`, `hotkey_hook`)**:
   - `extract_hwnd`, `is_windows_light_theme`, `sync_window_blur`, `GlassWindowBackdrop`
+  - Side-aware Left/Right modifier inspection & `WH_KEYBOARD_LL` global hotkey hook (`read_modifier_side_state`, `ModifierRequirement`, `SideAwareHotkeySpec`, `SideAwareHotkeyHook`)
   - Caption-control suppression so native `—`, `□`, `✕` buttons do not bleed onto frameless glass windows
-  - Multi-monitor position resolution & work-area clamping (`resolve_window_pos_in_work_area`, `clamp_popup_pos_to_monitor_px`, `set_window_pos_px_checked`)
+  - Tray-only tool-window configuration (`configure_tray_only_window`), flicker-free show/hide/cloak (`show_window_at_px`, `show_window_to_front`, `hide_window`, `set_window_cloaked`, `position_window_px_no_activate`), and `is_win_key_pressed`
+  - Multi-monitor position resolution, cursor/primary monitor work-area queries, and centered overlay sizing (`resolve_window_pos_in_work_area`, `center_on_primary_work_area_px`, `get_primary_monitor_work_area_px`, `get_cursor_monitor_work_area_px`, `compute_overlay_rect_in_work_area`, `clamp_popup_pos_to_monitor_px`, `set_window_pos_px_checked`)
+- **Typography & Editor Font Families (`fonts`)**:
+  - `install_system_font`, `discover_installed_fonts`, `install_glass_fonts`
+  - Named `editor`, `editor_bold`, `editor_italic`, `editor_bold_italic` font families alongside `Segoe UI` UI chrome
 - **Theme & Glass Surfaces (`style`)**:
   - `BackgroundMode` (`FrostedGlass` / `Transparent`), `GlassTintPreset` (`Dark` / `Light` / `System`)
-  - `GlassStyle`, `GlassPalette`, `apply_glass_visuals`
+  - `GlassStyle`, `GlassPalette` (including syntax/code/math tokens), `apply_glass_visuals`
   - `draw_glass_surface`, `draw_glass_surface_with_alpha`, `draw_glass_background`
 - **Glass Widgets (`widgets`)**:
-  - `install_system_font`, `draw_shadowed_text`, `draw_glass_titlebar`
+  - `draw_shadowed_text`, `draw_glass_titlebar`, `hover_chrome_opacity`, `glass_toast_pill`
   - `draw_glass_tab_bar`, `draw_glass_tab_bar_with_icons`
-  - `glass_card`, `glass_toggle_row`, `glass_segmented_control`, `glass_slider_row`
-  - `glass_button`, `glass_primary_button`, `glass_danger_button`, `draw_status_pill`, `glass_list_row`
+  - `glass_card`, `glass_grid_card`, `glass_toggle_row`, `glass_segmented_control`, `glass_slider_row`, `glass_keybind_row`
+  - `glass_button`, `glass_primary_button`, `glass_danger_button`, `glass_icon_button`, `glass_pagination_dots`, `draw_status_pill`, `glass_list_row`
 - **Native Glass Context Menu (`context_menu::GlassContextMenu`)**:
   - Standalone `AlwaysOnTop` Acrylic popup viewport with 2-frame flicker-free reveal, cubic fade-in/quadratic fade-out, dividers, checkmarks, shortcut badges, and danger styling
 - **Secondary Frameless Glass Window (`window::GlassWindow`)**:
-  - 2-frame flicker-free reveal, multi-monitor work-area placement, debounced physical drag position persistence, titlebar + scroll layout (`show_framed` / `show` / `show_raw`)
+  - 2-frame flicker-free reveal, multi-monitor work-area placement, optional tray-only (`with_taskbar(false)`), debounced physical drag position persistence, titlebar + scroll layout (`show_framed` / `show` / `show_raw`)
 
 ## Adding to Another Project
 

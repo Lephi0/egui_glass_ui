@@ -1,7 +1,8 @@
 use crate::dwm::{
-    bring_hwnd_to_front, configure_frameless_window, find_own_window_by_title,
-    get_monitor_work_area_for_hwnd, get_window_pos_px, hide_popup_window,
-    position_popup_window_px, resolve_window_pos_in_work_area, trim_process_working_set,
+    bring_hwnd_to_front, configure_frameless_window, configure_tray_only_window,
+    find_own_window_by_title, get_monitor_work_area_for_hwnd, get_window_pos_px,
+    hide_popup_window, position_popup_window_px, resolve_window_pos_in_work_area,
+    trim_process_working_set,
 };
 use crate::style::{
     apply_glass_visuals, draw_glass_surface, BackgroundMode, GlassPalette, GlassStyle,
@@ -22,6 +23,7 @@ pub struct GlassWindowConfig {
     pub default_size: Vec2,
     pub min_height: f32,
     pub always_on_top: bool,
+    pub taskbar: bool,
     pub icon: Option<IconData>,
 }
 
@@ -37,6 +39,7 @@ impl GlassWindowConfig {
             default_size,
             min_height: 400.0,
             always_on_top: true,
+            taskbar: true,
             icon: None,
         }
     }
@@ -48,6 +51,11 @@ impl GlassWindowConfig {
 
     pub fn with_always_on_top(mut self, always_on_top: bool) -> Self {
         self.always_on_top = always_on_top;
+        self
+    }
+
+    pub fn with_taskbar(mut self, taskbar: bool) -> Self {
+        self.taskbar = taskbar;
         self
     }
 
@@ -231,6 +239,7 @@ impl GlassWindow {
             .with_maximize_button(false)
             .with_close_button(false)
             .with_transparent(true)
+            .with_taskbar(self.config.taskbar)
             .with_resizable(false)
             .with_window_level(if self.config.always_on_top {
                 WindowLevel::AlwaysOnTop
@@ -275,7 +284,11 @@ impl GlassWindow {
 
             // Frame 1 (hidden): suppress transitions, apply Acrylic glass backdrop, and place on target monitor.
             if !self.revealed {
-                configure_frameless_window(self.hwnd);
+                if self.config.taskbar {
+                    configure_frameless_window(self.hwnd);
+                } else {
+                    configure_tray_only_window(self.hwnd);
+                }
                 self.glass_backdrop.sync(
                     self.hwnd,
                     BackgroundMode::FrostedGlass,
@@ -304,7 +317,11 @@ impl GlassWindow {
 
             // Frame 2: reveal and focus cleanly without DWM transition flicker.
             if !self.activated {
-                configure_frameless_window(self.hwnd);
+                if self.config.taskbar {
+                    configure_frameless_window(self.hwnd);
+                } else {
+                    configure_tray_only_window(self.hwnd);
+                }
                 position_popup_window_px(
                     self.hwnd,
                     pos_px[0],
