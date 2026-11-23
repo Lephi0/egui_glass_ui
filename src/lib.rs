@@ -29,8 +29,8 @@ pub use fonts::{
     EDITOR_FONT_FAMILY, EDITOR_ITALIC_FONT_FAMILY,
 };
 pub use hotkey_hook::{
-    read_modifier_side_state, ModifierRequirement, ModifierSideState, SideAwareHotkeyHook,
-    SideAwareHotkeySpec,
+    is_side_aware_hook_active, read_modifier_side_state, unregister_raw_keyboard_input,
+    ModifierRequirement, ModifierSideState, SideAwareHotkeyHook, SideAwareHotkeySpec,
 };
 pub use style::{
     apply_glass_visuals, draw_glass_background, draw_glass_surface,

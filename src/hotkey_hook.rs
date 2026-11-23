@@ -1,20 +1,33 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+#[cfg(windows)]
+use std::sync::atomic::AtomicUsize;
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{LPARAM, LRESULT, WPARAM},
-    System::Threading::GetCurrentThreadId,
+    Devices::HumanInterfaceDevice::{HID_USAGE_GENERIC_KEYBOARD, HID_USAGE_PAGE_GENERIC},
+    Foundation::{CloseHandle, HANDLE, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        Memory::{VirtualLock, VirtualUnlock},
+        Threading::{
+            CreateEventW, GetCurrentThread, GetCurrentThreadId, INFINITE, SetEvent,
+            SetThreadPriority, THREAD_PRIORITY_HIGHEST, WaitForMultipleObjects,
+        },
+    },
     UI::{
-        Input::KeyboardAndMouse::{
-            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-            SendInput, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU,
-            VK_RSHIFT, VK_RWIN,
+        Input::{
+            RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices,
+            KeyboardAndMouse::{
+                GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+                SendInput, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU,
+                VK_RSHIFT, VK_RWIN,
+            },
         },
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG,
-            PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-            WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
+            UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN,
+            WM_SYSKEYUP,
         },
     },
 };
@@ -184,28 +197,94 @@ impl SideAwareHotkeySpec {
     }
 }
 
-static HOOK_ENABLED: AtomicBool = AtomicBool::new(false);
-static HOOK_PAUSED: AtomicBool = AtomicBool::new(false);
-static HOOK_TARGET_VK: AtomicU32 = AtomicU32::new(0);
-static HOOK_MOD_SPEC: AtomicU32 = AtomicU32::new(0);
-static HOOK_HELD: AtomicBool = AtomicBool::new(false);
-#[cfg(windows)]
-static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
-#[cfg(windows)]
-static HOOK_ALTGR_SYNTH_LCTRL: AtomicBool = AtomicBool::new(false);
-#[cfg(windows)]
-const WM_HOOK_TRIGGERED: u32 = 0x8001; // WM_APP + 1
+fn pack_full_spec(spec: SideAwareHotkeySpec) -> u32 {
+    ((spec.vk_code & 0xFFFF) << 16) | (spec.pack_modifiers() & 0xFFFF)
+}
 
-type TriggerCallback = Box<dyn Fn() + Send + Sync + 'static>;
-static HOOK_CALLBACK: OnceLock<Mutex<Option<TriggerCallback>>> = OnceLock::new();
+fn unpack_full_spec(packed: u32) -> SideAwareHotkeySpec {
+    SideAwareHotkeySpec::unpack(packed >> 16, packed & 0xFFFF)
+}
+
+#[repr(C, align(64))]
+struct HookHotState {
+    enabled: AtomicBool,
+    paused: AtomicBool,
+    held: AtomicBool,
+    #[cfg(windows)]
+    altgr_synth_lctrl: AtomicBool,
+    packed_spec: AtomicU32,
+    #[cfg(windows)]
+    last_held_down_ms: AtomicU32,
+    #[cfg(windows)]
+    trigger_flags: AtomicU32,
+    #[cfg(windows)]
+    trigger_event: AtomicUsize,
+}
+
+static HOOK_HOT: HookHotState = HookHotState {
+    enabled: AtomicBool::new(false),
+    paused: AtomicBool::new(false),
+    held: AtomicBool::new(false),
+    #[cfg(windows)]
+    altgr_synth_lctrl: AtomicBool::new(false),
+    packed_spec: AtomicU32::new(0),
+    #[cfg(windows)]
+    last_held_down_ms: AtomicU32::new(0),
+    #[cfg(windows)]
+    trigger_flags: AtomicU32::new(0),
+    #[cfg(windows)]
+    trigger_event: AtomicUsize::new(0),
+};
+
+#[cfg(windows)]
+const TRIGGER_PENDING_BIT: u32 = 1 << 0;
+#[cfg(windows)]
+const TRIGGER_MASK_MENU_BIT: u32 = 1 << 1;
+const HELD_STALE_TIMEOUT_MS: u32 = 1250;
+
+fn should_fire_hotkey_trigger(was_held: bool, prev_down_ms: u32, now_ms: u32) -> bool {
+    !was_held || now_ms.wrapping_sub(prev_down_ms) > HELD_STALE_TIMEOUT_MS
+}
+
+/// Unregisters keyboard Raw Input (`HID_USAGE_GENERIC_KEYBOARD`) for this process so
+/// Windows 11 does not bypass `WH_KEYBOARD_LL` hooks (such as PowerToys Keyboard Manager)
+/// when the app's window first gains focus, while keeping `WM_KEY*`/`WM_CHAR` and mouse
+/// Raw Input intact.
+pub fn unregister_raw_keyboard_input() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        let dev = RAWINPUTDEVICE {
+            usUsagePage: HID_USAGE_PAGE_GENERIC,
+            usUsage: HID_USAGE_GENERIC_KEYBOARD,
+            dwFlags: RIDEV_REMOVE,
+            hwndTarget: std::ptr::null_mut(),
+        };
+        RegisterRawInputDevices(&dev, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) != 0
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// Returns `true` when a `SideAwareHotkeyHook` is currently active.
+pub fn is_side_aware_hook_active() -> bool {
+    HOOK_HOT.enabled.load(Ordering::Relaxed)
+}
 
 /// Low-level Windows keyboard hook (`WH_KEYBOARD_LL`) that intercepts side-specific global hotkeys
 /// while letting all other combinations (including the opposite modifier side) pass through untouched.
 pub struct SideAwareHotkeyHook {
     #[cfg(windows)]
-    thread_id: u32,
+    hook_thread_id: u32,
     #[cfg(windows)]
-    join_handle: Option<std::thread::JoinHandle<()>>,
+    hook_join_handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(windows)]
+    worker_join_handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(windows)]
+    trigger_event: usize,
+    #[cfg(windows)]
+    stop_event: usize,
 }
 
 impl SideAwareHotkeyHook {
@@ -213,74 +292,192 @@ impl SideAwareHotkeyHook {
         spec: SideAwareHotkeySpec,
         on_trigger: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let cb_slot = HOOK_CALLBACK.get_or_init(|| Mutex::new(None));
-        if let Ok(mut guard) = cb_slot.lock() {
-            *guard = Some(Box::new(on_trigger));
-        }
-
-        HOOK_TARGET_VK.store(spec.vk_code, Ordering::SeqCst);
-        HOOK_MOD_SPEC.store(spec.pack_modifiers(), Ordering::SeqCst);
-        HOOK_HELD.store(false, Ordering::SeqCst);
-        HOOK_PAUSED.store(false, Ordering::SeqCst);
-        HOOK_ENABLED.store(true, Ordering::SeqCst);
-
         #[cfg(windows)]
         {
-            HOOK_ALTGR_SYNTH_LCTRL.store(false, Ordering::SeqCst);
+            let trigger_event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            if trigger_event.is_null() {
+                return Err(format!(
+                    "Failed to create hotkey trigger event: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let stop_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if stop_event.is_null() {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    let _ = CloseHandle(trigger_event);
+                }
+                return Err(format!("Failed to create hotkey stop event: {err}"));
+            }
+
+            let trigger_raw = trigger_event as usize;
+            let stop_raw = stop_event as usize;
+
+            HOOK_HOT
+                .packed_spec
+                .store(pack_full_spec(spec), Ordering::SeqCst);
+            HOOK_HOT.held.store(false, Ordering::SeqCst);
+            HOOK_HOT.last_held_down_ms.store(0, Ordering::SeqCst);
+            HOOK_HOT.paused.store(false, Ordering::SeqCst);
+            HOOK_HOT.altgr_synth_lctrl.store(false, Ordering::SeqCst);
+            HOOK_HOT.trigger_flags.store(0, Ordering::SeqCst);
+            HOOK_HOT
+                .trigger_event
+                .store(trigger_raw, Ordering::Release);
+            HOOK_HOT.enabled.store(true, Ordering::SeqCst);
+
+            let worker_res = std::thread::Builder::new()
+                .name("rapid_side_hotkey_worker".to_string())
+                .spawn(move || unsafe {
+                    let handles = [stop_raw as HANDLE, trigger_raw as HANDLE];
+                    const WAIT_TRIGGER: u32 = WAIT_OBJECT_0 + 1;
+                    loop {
+                        let wait = WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE);
+                        if wait == WAIT_TRIGGER {
+                            let flags = HOOK_HOT.trigger_flags.swap(0, Ordering::AcqRel);
+                            if (flags & TRIGGER_PENDING_BIT) != 0
+                                && HOOK_HOT.enabled.load(Ordering::Acquire)
+                            {
+                                if (flags & TRIGGER_MASK_MENU_BIT) != 0 {
+                                    suppress_menu_on_modifier_release();
+                                }
+                                on_trigger();
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                });
+
+            let worker_join_handle = match worker_res {
+                Ok(handle) => handle,
+                Err(e) => {
+                    HOOK_HOT.enabled.store(false, Ordering::SeqCst);
+                    HOOK_HOT.trigger_event.store(0, Ordering::SeqCst);
+                    unsafe {
+                        let _ = CloseHandle(trigger_event);
+                        let _ = CloseHandle(stop_event);
+                    }
+                    return Err(format!("Failed to spawn hotkey worker thread: {e}"));
+                }
+            };
+
             let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
-            let join_handle = std::thread::Builder::new()
+            let hook_res = std::thread::Builder::new()
                 .name("rapid_side_hotkey_hook".to_string())
                 .spawn(move || unsafe {
+                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+                    let mut msg: MSG = std::mem::zeroed();
+                    let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+
+                    // Best-effort pin hot static state, hook callback, and active stack page so
+                    // system working-set pressure cannot trigger hard page faults inside WH_KEYBOARD_LL.
+                    let mut locked_regions: [(*const core::ffi::c_void, usize); 3] =
+                        [(std::ptr::null(), 0); 3];
+                    let mut locked_count = 0usize;
+                    let mut try_lock = |addr: *const core::ffi::c_void, len: usize| -> bool {
+                        if !addr.is_null() && len > 0 && VirtualLock(addr, len) != 0 {
+                            locked_regions[locked_count] = (addr, len);
+                            locked_count += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    let _ = try_lock(
+                        &HOOK_HOT as *const HookHotState as *const core::ffi::c_void,
+                        std::mem::size_of::<HookHotState>(),
+                    );
+                    let proc_addr = ll_keyboard_proc as *const () as *const core::ffi::c_void;
+                    if !try_lock(proc_addr, 512) {
+                        let _ = try_lock(proc_addr, 1);
+                    }
+                    let _ = try_lock(
+                        &msg as *const MSG as *const core::ffi::c_void,
+                        std::mem::size_of::<MSG>(),
+                    );
+
+                    let unlock_all = |regions: &[(*const core::ffi::c_void, usize)]| {
+                        for &(addr, len) in regions {
+                            if !addr.is_null() && len > 0 {
+                                let _ = VirtualUnlock(addr, len);
+                            }
+                        }
+                    };
+
                     let tid = GetCurrentThreadId();
-                    HOOK_THREAD_ID.store(tid, Ordering::SeqCst);
+                    let hmod = GetModuleHandleW(std::ptr::null());
                     let hhook: HHOOK =
-                        SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), std::ptr::null_mut(), 0);
+                        SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), hmod, 0);
                     if hhook.is_null() {
-                        HOOK_THREAD_ID.store(0, Ordering::SeqCst);
+                        let err = std::io::Error::last_os_error();
+                        unlock_all(&locked_regions[..locked_count]);
                         let _ = ready_tx.send(Err(format!(
-                            "Failed to install keyboard hook: {}",
-                            std::io::Error::last_os_error()
+                            "Failed to install keyboard hook: {err}"
                         )));
                         return;
                     }
                     let _ = ready_tx.send(Ok(tid));
 
-                    let mut msg: MSG = std::mem::zeroed();
                     while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-                        if msg.message == WM_HOOK_TRIGGERED {
-                            if msg.wParam != 0 {
-                                suppress_menu_on_modifier_release();
-                            }
-                            if let Some(lock) = HOOK_CALLBACK.get() {
-                                if let Ok(guard) = lock.lock() {
-                                    if let Some(ref cb) = *guard {
-                                        cb();
-                                    }
-                                }
-                            }
-                            continue;
-                        }
                         let _ = TranslateMessage(&msg);
                         let _ = DispatchMessageW(&msg);
                     }
                     let _ = UnhookWindowsHookEx(hhook);
-                    HOOK_THREAD_ID.store(0, Ordering::SeqCst);
-                })
-                .map_err(|e| format!("Failed to spawn hotkey hook thread: {e}"))?;
+                    unlock_all(&locked_regions[..locked_count]);
+                });
+
+            let hook_join_handle = match hook_res {
+                Ok(handle) => handle,
+                Err(e) => {
+                    HOOK_HOT.enabled.store(false, Ordering::SeqCst);
+                    HOOK_HOT.trigger_event.store(0, Ordering::SeqCst);
+                    unsafe {
+                        let _ = SetEvent(stop_event);
+                    }
+                    let _ = worker_join_handle.join();
+                    unsafe {
+                        let _ = CloseHandle(trigger_event);
+                        let _ = CloseHandle(stop_event);
+                    }
+                    return Err(format!("Failed to spawn hotkey hook thread: {e}"));
+                }
+            };
 
             match ready_rx.recv() {
-                Ok(Ok(thread_id)) => Ok(Self {
-                    thread_id,
-                    join_handle: Some(join_handle),
+                Ok(Ok(hook_thread_id)) => Ok(Self {
+                    hook_thread_id,
+                    hook_join_handle: Some(hook_join_handle),
+                    worker_join_handle: Some(worker_join_handle),
+                    trigger_event: trigger_raw,
+                    stop_event: stop_raw,
                 }),
                 Ok(Err(err)) => {
-                    HOOK_ENABLED.store(false, Ordering::SeqCst);
-                    let _ = join_handle.join();
+                    HOOK_HOT.enabled.store(false, Ordering::SeqCst);
+                    let _ = hook_join_handle.join();
+                    HOOK_HOT.trigger_event.store(0, Ordering::SeqCst);
+                    unsafe {
+                        let _ = SetEvent(stop_event);
+                    }
+                    let _ = worker_join_handle.join();
+                    unsafe {
+                        let _ = CloseHandle(trigger_event);
+                        let _ = CloseHandle(stop_event);
+                    }
                     Err(err)
                 }
                 Err(_) => {
-                    HOOK_ENABLED.store(false, Ordering::SeqCst);
-                    let _ = join_handle.join();
+                    HOOK_HOT.enabled.store(false, Ordering::SeqCst);
+                    let _ = hook_join_handle.join();
+                    HOOK_HOT.trigger_event.store(0, Ordering::SeqCst);
+                    unsafe {
+                        let _ = SetEvent(stop_event);
+                    }
+                    let _ = worker_join_handle.join();
+                    unsafe {
+                        let _ = CloseHandle(trigger_event);
+                        let _ = CloseHandle(stop_event);
+                    }
                     Err("Keyboard hook thread exited unexpectedly".to_string())
                 }
             }
@@ -288,38 +485,58 @@ impl SideAwareHotkeyHook {
 
         #[cfg(not(windows))]
         {
+            let _ = on_trigger;
+            HOOK_HOT
+                .packed_spec
+                .store(pack_full_spec(spec), Ordering::SeqCst);
+            HOOK_HOT.held.store(false, Ordering::SeqCst);
+            HOOK_HOT.paused.store(false, Ordering::SeqCst);
+            HOOK_HOT.enabled.store(true, Ordering::SeqCst);
             Ok(Self {})
         }
     }
 
     pub fn update_spec(&self, spec: SideAwareHotkeySpec) {
-        HOOK_TARGET_VK.store(spec.vk_code, Ordering::SeqCst);
-        HOOK_MOD_SPEC.store(spec.pack_modifiers(), Ordering::SeqCst);
-        HOOK_HELD.store(false, Ordering::SeqCst);
+        HOOK_HOT
+            .packed_spec
+            .store(pack_full_spec(spec), Ordering::SeqCst);
+        HOOK_HOT.held.store(false, Ordering::SeqCst);
+        #[cfg(windows)]
+        HOOK_HOT.last_held_down_ms.store(0, Ordering::SeqCst);
     }
 
     pub fn set_paused(&self, paused: bool) {
-        HOOK_PAUSED.store(paused, Ordering::SeqCst);
-        HOOK_HELD.store(false, Ordering::SeqCst);
+        HOOK_HOT.paused.store(paused, Ordering::SeqCst);
+        HOOK_HOT.held.store(false, Ordering::SeqCst);
+        #[cfg(windows)]
+        HOOK_HOT.last_held_down_ms.store(0, Ordering::SeqCst);
     }
 }
 
 impl Drop for SideAwareHotkeyHook {
     fn drop(&mut self) {
-        HOOK_ENABLED.store(false, Ordering::SeqCst);
-        HOOK_HELD.store(false, Ordering::SeqCst);
-        if let Some(lock) = HOOK_CALLBACK.get() {
-            if let Ok(mut guard) = lock.lock() {
-                *guard = None;
-            }
-        }
+        HOOK_HOT.enabled.store(false, Ordering::SeqCst);
+        HOOK_HOT.held.store(false, Ordering::SeqCst);
         #[cfg(windows)]
         {
+            HOOK_HOT.last_held_down_ms.store(0, Ordering::SeqCst);
+            HOOK_HOT.trigger_flags.store(0, Ordering::SeqCst);
             unsafe {
-                let _ = PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0);
+                let _ = PostThreadMessageW(self.hook_thread_id, WM_QUIT, 0, 0);
             }
-            if let Some(handle) = self.join_handle.take() {
+            if let Some(handle) = self.hook_join_handle.take() {
                 let _ = handle.join();
+            }
+            HOOK_HOT.trigger_event.store(0, Ordering::SeqCst);
+            unsafe {
+                let _ = SetEvent(self.stop_event as HANDLE);
+            }
+            if let Some(handle) = self.worker_join_handle.take() {
+                let _ = handle.join();
+            }
+            unsafe {
+                let _ = CloseHandle(self.trigger_event as HANDLE);
+                let _ = CloseHandle(self.stop_event as HANDLE);
             }
         }
     }
@@ -354,58 +571,61 @@ unsafe fn suppress_menu_on_modifier_release() {
 #[cfg(windows)]
 unsafe extern "system" fn ll_keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
-        if ncode < 0 || !HOOK_ENABLED.load(Ordering::Relaxed) {
+        if ncode < 0 || !HOOK_HOT.enabled.load(Ordering::Relaxed) {
             return CallNextHookEx(std::ptr::null_mut(), ncode, wparam, lparam);
         }
 
         let kb = &*(lparam as *const KBDLLHOOKSTRUCT);
         const LLKHF_INJECTED: u32 = 0x10;
-        if (kb.flags & LLKHF_INJECTED) != 0 {
-            return CallNextHookEx(std::ptr::null_mut(), ncode, wparam, lparam);
-        }
 
-        let msg = wparam as u32;
-        let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-        let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+        if (kb.flags & LLKHF_INJECTED) == 0 {
+            let msg = wparam as u32;
+            let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+            let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
 
-        // Track Windows' synthetic LControl generated by AltGr (RAlt on international layouts)
-        if kb.vkCode == VK_LCONTROL as u32 {
-            if is_down {
-                HOOK_ALTGR_SYNTH_LCTRL.store(kb.scanCode == 0x21D, Ordering::Relaxed);
-            } else if is_up {
-                HOOK_ALTGR_SYNTH_LCTRL.store(false, Ordering::Relaxed);
-            }
-        }
-
-        let target_vk = HOOK_TARGET_VK.load(Ordering::Relaxed);
-        if kb.vkCode == target_vk {
-            if is_up {
-                HOOK_HELD.store(false, Ordering::Relaxed);
-            } else if is_down && !HOOK_PAUSED.load(Ordering::Relaxed) {
-                let spec = SideAwareHotkeySpec::unpack(
-                    target_vk,
-                    HOOK_MOD_SPEC.load(Ordering::Relaxed),
-                );
-                let mut state = read_modifier_side_state();
-                if state.ralt && state.lctrl && HOOK_ALTGR_SYNTH_LCTRL.load(Ordering::Relaxed) {
-                    state.lctrl = false;
+            // Track Windows' synthetic LControl generated by AltGr (RAlt on international layouts)
+            if kb.vkCode == VK_LCONTROL as u32 {
+                if is_down {
+                    HOOK_HOT
+                        .altgr_synth_lctrl
+                        .store(kb.scanCode == 0x21D, Ordering::Relaxed);
+                } else if is_up {
+                    HOOK_HOT.altgr_synth_lctrl.store(false, Ordering::Relaxed);
                 }
+            }
 
-                if spec.matches_modifiers(state) {
-                    if !HOOK_HELD.swap(true, Ordering::SeqCst) {
-                        let mask_menu = spec.win != ModifierRequirement::None
-                            || spec.alt != ModifierRequirement::None;
-                        let tid = HOOK_THREAD_ID.load(Ordering::Relaxed);
-                        if tid != 0 {
-                            let _ = PostThreadMessageW(
-                                tid,
-                                WM_HOOK_TRIGGERED,
-                                usize::from(mask_menu),
-                                0,
-                            );
-                        }
+            let packed_spec = HOOK_HOT.packed_spec.load(Ordering::Relaxed);
+            let target_vk = packed_spec >> 16;
+            if kb.vkCode == target_vk {
+                if is_up {
+                    HOOK_HOT.held.store(false, Ordering::Relaxed);
+                } else if is_down && !HOOK_HOT.paused.load(Ordering::Relaxed) {
+                    let spec = unpack_full_spec(packed_spec);
+                    let mut state = read_modifier_side_state();
+                    if state.ralt
+                        && state.lctrl
+                        && HOOK_HOT.altgr_synth_lctrl.load(Ordering::Relaxed)
+                    {
+                        state.lctrl = false;
                     }
-                    return 1;
+
+                    if spec.matches_modifiers(state) {
+                        let now_ms = kb.time;
+                        let prev_ms = HOOK_HOT.last_held_down_ms.swap(now_ms, Ordering::Relaxed);
+                        let was_held = HOOK_HOT.held.swap(true, Ordering::SeqCst);
+                        if should_fire_hotkey_trigger(was_held, prev_ms, now_ms) {
+                            let mask_menu = spec.win != ModifierRequirement::None
+                                || spec.alt != ModifierRequirement::None;
+                            let flags = TRIGGER_PENDING_BIT
+                                | if mask_menu { TRIGGER_MASK_MENU_BIT } else { 0 };
+                            HOOK_HOT.trigger_flags.fetch_or(flags, Ordering::Release);
+                            let ev = HOOK_HOT.trigger_event.load(Ordering::Acquire);
+                            if ev != 0 {
+                                let _ = SetEvent(ev as HANDLE);
+                            }
+                        }
+                        return 1;
+                    }
                 }
             }
         }
@@ -478,5 +698,89 @@ mod tests {
             ..Default::default()
         };
         assert!(!unpacked.matches_modifiers(wrong_win));
+    }
+
+    #[test]
+    fn test_pack_unpack_full_spec() {
+        let reqs = [
+            ModifierRequirement::None,
+            ModifierRequirement::Any,
+            ModifierRequirement::Left,
+            ModifierRequirement::Right,
+            ModifierRequirement::Both,
+        ];
+        for (idx, &win) in reqs.iter().enumerate() {
+            for &ctrl in &reqs {
+                for &alt in &reqs {
+                    for &shift in &reqs {
+                        let spec = SideAwareHotkeySpec {
+                            vk_code: 0x41 + (idx as u32),
+                            win,
+                            ctrl,
+                            alt,
+                            shift,
+                        };
+                        let packed = pack_full_spec(spec);
+                        let unpacked = unpack_full_spec(packed);
+                        assert_eq!(unpacked, spec);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_side_aware_hook_lifecycle_and_active_flag() {
+        assert!(!is_side_aware_hook_active());
+        let spec = SideAwareHotkeySpec {
+            vk_code: 0x41,
+            win: ModifierRequirement::None,
+            ctrl: ModifierRequirement::None,
+            alt: ModifierRequirement::None,
+            shift: ModifierRequirement::Right,
+        };
+        let hook = SideAwareHotkeyHook::new(spec, || {}).expect("install side-aware hook");
+        assert!(is_side_aware_hook_active());
+
+        let updated = SideAwareHotkeySpec {
+            vk_code: 0x42,
+            win: ModifierRequirement::Left,
+            ctrl: ModifierRequirement::None,
+            alt: ModifierRequirement::None,
+            shift: ModifierRequirement::None,
+        };
+        hook.update_spec(updated);
+        assert_eq!(unpack_full_spec(HOOK_HOT.packed_spec.load(Ordering::SeqCst)), updated);
+
+        hook.set_paused(true);
+        assert!(HOOK_HOT.paused.load(Ordering::SeqCst));
+        hook.set_paused(false);
+        assert!(!HOOK_HOT.paused.load(Ordering::SeqCst));
+
+        // Trimming the working set while the hook is active must remain safe (hot hook pages are VirtualLock'd)
+        crate::dwm::trim_process_working_set();
+        assert!(is_side_aware_hook_active());
+
+        drop(hook);
+        assert!(!is_side_aware_hook_active());
+    }
+
+    #[test]
+    fn test_should_fire_hotkey_trigger_blocks_repeats_and_recovers_stale_held() {
+        assert!(should_fire_hotkey_trigger(false, 5_000, 5_000));
+        assert!(should_fire_hotkey_trigger(false, 5_000, 5_010));
+
+        // Hardware auto-repeats within the stale timeout remain suppressed while held
+        assert!(!should_fire_hotkey_trigger(true, 10_000, 10_030));
+        assert!(!should_fire_hotkey_trigger(true, 10_000, 10_500));
+        assert!(!should_fire_hotkey_trigger(true, 10_000, 10_000 + HELD_STALE_TIMEOUT_MS));
+
+        // Missed key-up (e.g., UAC / Secure Desktop) recovers once elapsed exceeds timeout
+        assert!(should_fire_hotkey_trigger(true, 10_000, 10_000 + HELD_STALE_TIMEOUT_MS + 1));
+
+        // Works safely across u32::MAX GetTickCount wraparound
+        let prev = u32::MAX - 200;
+        assert!(!should_fire_hotkey_trigger(true, prev, 100));
+        assert!(should_fire_hotkey_trigger(true, prev, HELD_STALE_TIMEOUT_MS - 199));
     }
 }
