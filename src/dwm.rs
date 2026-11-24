@@ -5,14 +5,15 @@ use std::ffi::c_void;
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{HWND, POINT, RECT},
+    Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::{
         Dwm::{
             DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND, DWM_SYSTEMBACKDROP_TYPE, DWMWA_CLOAK,
             DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
             DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
             DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
-            DwmEnableBlurBehindWindow, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+            DwmEnableBlurBehindWindow, DwmExtendFrameIntoClientArea, DwmFlush,
+            DwmSetWindowAttribute,
         },
         Gdi::{
             CreateRectRgn, DeleteObject, GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST,
@@ -37,13 +38,15 @@ use windows_sys::Win32::{
             KEYEVENTF_KEYUP, SendInput, SetActiveWindow, SetFocus, VK_LWIN, VK_MENU, VK_RWIN,
         },
         WindowsAndMessaging::{
-            BringWindowToTop, FindWindowExW, GWL_EXSTYLE, GWL_STYLE, GetCursorPos,
-            GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-            GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible, SM_CXSCREEN,
-            SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
-            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-            SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, ShowWindowAsync,
-            WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+            BringWindowToTop, CallWindowProcW, DefWindowProcW, FindWindowExW, GWL_EXSTYLE,
+            GWL_STYLE, GWLP_WNDPROC, GetCursorPos, GetForegroundWindow, GetPropW,
+            GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+            HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible, RemovePropW, SM_CXSCREEN, SM_CYSCREEN,
+            SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetPropW,
+            SetWindowLongPtrW, SetWindowPos, ShowWindow, ShowWindowAsync, WM_NCACTIVATE,
+            WM_NCDESTROY, WNDPROC, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX,
+            WS_MINIMIZEBOX, WS_SYSMENU,
         },
     },
 };
@@ -51,6 +54,75 @@ use windows_sys::Win32::{
 // DWMWA_COLOR_DEFAULT = 0xFFFFFFFF restores the default Windows 11 1px system border
 #[cfg(windows)]
 const DWMWA_COLOR_DEFAULT: u32 = 0xFFFFFFFF;
+
+#[cfg(windows)]
+const PROP_ORIG_WNDPROC: &[u16] = &[
+    b'E' as u16, b'g' as u16, b'u' as u16, b'i' as u16, b'G' as u16, b'l' as u16, b'a' as u16,
+    b's' as u16, b's' as u16, b'O' as u16, b'r' as u16, b'i' as u16, b'g' as u16, b'W' as u16,
+    b'n' as u16, b'd' as u16, b'P' as u16, b'r' as u16, b'o' as u16, b'c' as u16, 0,
+];
+
+#[cfg(windows)]
+const PROP_KEEP_ACTIVE: &[u16] = &[
+    b'E' as u16, b'g' as u16, b'u' as u16, b'i' as u16, b'G' as u16, b'l' as u16, b'a' as u16,
+    b's' as u16, b's' as u16, b'K' as u16, b'e' as u16, b'e' as u16, b'p' as u16, b'A' as u16,
+    b'c' as u16, b't' as u16, b'i' as u16, b'v' as u16, b'e' as u16, 0,
+];
+
+#[cfg(windows)]
+unsafe extern "system" fn glass_ncactivate_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        let orig = GetPropW(hwnd, PROP_ORIG_WNDPROC.as_ptr()) as isize;
+        if orig == 0 {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        let prev: WNDPROC = Some(std::mem::transmute::<
+            isize,
+            unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+        >(orig));
+
+        if msg == WM_NCDESTROY {
+            let _ = RemovePropW(hwnd, PROP_KEEP_ACTIVE.as_ptr());
+            let _ = RemovePropW(hwnd, PROP_ORIG_WNDPROC.as_ptr());
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, orig);
+            return CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+        }
+
+        if msg == WM_NCACTIVATE && !GetPropW(hwnd, PROP_KEEP_ACTIVE.as_ptr()).is_null() {
+            // Keep DWM Acrylic active across focus transitions; winit's WM_KILLFOCUS still updates focus state.
+            if wparam == 0 {
+                return CallWindowProcW(prev, hwnd, msg, 1, -1);
+            }
+            return CallWindowProcW(prev, hwnd, msg, 1, lparam);
+        }
+
+        CallWindowProcW(prev, hwnd, msg, wparam, lparam)
+    }
+}
+
+#[cfg(windows)]
+unsafe fn set_always_active_backdrop(hwnd: HWND, enabled: bool) {
+    unsafe {
+        if enabled {
+            if GetPropW(hwnd, PROP_ORIG_WNDPROC.as_ptr()).is_null() {
+                let cur = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+                let hook_ptr = glass_ncactivate_wndproc as *const () as isize;
+                if cur != 0 && cur != hook_ptr {
+                    let _ = SetPropW(hwnd, PROP_ORIG_WNDPROC.as_ptr(), cur as HANDLE);
+                    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook_ptr);
+                }
+            }
+            let _ = SetPropW(hwnd, PROP_KEEP_ACTIVE.as_ptr(), 1usize as HANDLE);
+        } else {
+            let _ = RemovePropW(hwnd, PROP_KEEP_ACTIVE.as_ptr());
+        }
+    }
+}
 
 pub fn extract_hwnd(window: &(impl HasWindowHandle + ?Sized)) -> Option<isize> {
     let handle = window.window_handle().ok()?;
@@ -166,6 +238,8 @@ pub fn sync_window_blur(hwnd_raw: Option<isize>, mode: BackgroundMode, is_light:
 
             match mode {
                 BackgroundMode::FrostedGlass => {
+                    set_always_active_backdrop(hwnd, true);
+
                     // Extend frame into client area ONLY in FrostedGlass mode so Windows 11 Acrylic backdrop renders
                     let margins = MARGINS {
                         cxLeftWidth: -1,
@@ -193,6 +267,8 @@ pub fn sync_window_blur(hwnd_raw: Option<isize>, mode: BackgroundMode, is_light:
                     );
                 }
                 BackgroundMode::Transparent => {
+                    set_always_active_backdrop(hwnd, false);
+
                     // Disable system backdrop blur completely
                     let backdrop_none: DWM_SYSTEMBACKDROP_TYPE = DWMSBT_NONE;
                     let _ = DwmSetWindowAttribute(
@@ -254,6 +330,10 @@ pub fn sync_window_blur(hwnd_raw: Option<isize>, mode: BackgroundMode, is_light:
                     0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
                 );
+            }
+
+            if mode == BackgroundMode::FrostedGlass {
+                let _ = DefWindowProcW(hwnd, WM_NCACTIVATE, 1, 0);
             }
         }
     }
@@ -881,15 +961,8 @@ unsafe fn force_foreground_hwnd(hwnd: HWND) -> bool {
 }
 
 #[cfg(windows)]
-unsafe fn reveal_and_focus_hwnd(hwnd: HWND, always_on_top: bool) {
+unsafe fn show_and_order_hwnd(hwnd: HWND, always_on_top: bool) -> bool {
     unsafe {
-        let cloak: u32 = 0;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAK as u32,
-            &cloak as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u32,
-        );
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetWindowPos(
             hwnd,
@@ -898,7 +971,7 @@ unsafe fn reveal_and_focus_hwnd(hwnd: HWND, always_on_top: bool) {
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
         if !always_on_top {
             let _ = SetWindowPos(
@@ -908,11 +981,75 @@ unsafe fn reveal_and_focus_hwnd(hwnd: HWND, always_on_top: bool) {
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
         }
-        let _ = force_foreground_hwnd(hwnd);
+        force_foreground_hwnd(hwnd)
     }
+}
+
+#[cfg(windows)]
+unsafe fn reveal_and_focus_hwnd(hwnd: HWND, always_on_top: bool) {
+    unsafe {
+        let _ = show_and_order_hwnd(hwnd, always_on_top);
+        let _ = DwmFlush();
+        let cloak: u32 = 0;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK as u32,
+            &cloak as *const u32 as *const _,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
+
+/// Flushes DWM composition so pending backdrop/surface updates complete before uncloaking.
+pub fn flush_dwm() {
+    #[cfg(windows)]
+    unsafe {
+        let _ = DwmFlush();
+    }
+}
+
+/// Attempts to bring `hwnd_raw` to the foreground and focus it.
+pub fn focus_window(hwnd_raw: Option<isize>) -> bool {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        return unsafe { force_foreground_hwnd(raw as HWND) };
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+    false
+}
+
+/// Positions, shows, sets Z-order, and focuses a window while keeping `DWMWA_CLOAK` enabled
+/// so the caller can render/sync DWM Acrylic before uncloaking cleanly.
+pub fn prepare_window_cloaked_at_px(
+    hwnd_raw: Option<isize>,
+    pos_px: [i32; 2],
+    size_px: [i32; 2],
+    always_on_top: bool,
+) -> bool {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        set_window_cloaked(Some(raw), true);
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                pos_px[0],
+                pos_px[1],
+                size_px[0],
+                size_px[1],
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            return show_and_order_hwnd(hwnd, always_on_top);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (hwnd_raw, pos_px, size_px, always_on_top);
+    false
 }
 
 /// Shows a hidden or background window and focuses it without `SW_RESTORE` transition animations.
