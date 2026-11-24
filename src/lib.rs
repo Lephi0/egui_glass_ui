@@ -19,8 +19,9 @@ pub use dwm::{
     get_window_pos_px, hide_popup_window, hide_window, is_pos_on_any_monitor, is_win_key_pressed,
     is_window_foreground, is_window_visible, is_windows_light_theme, needs_caption_suppression,
     position_popup_window_px, position_window_px_no_activate, primary_monitor_center_pos_px,
-    resize_window_px, resolve_window_pos_in_work_area, set_window_cloaked,
-    set_window_pos_px_checked, show_window_at_px, show_window_to_front, sync_window_blur,
+    resize_window_px, resolve_window_pos_in_work_area, set_window_always_on_top,
+    set_window_cloaked, set_window_pos_px_checked, show_window_at_px, show_window_to_front,
+    sync_window_blur,
     trim_process_working_set, wake_cloaked_window,
 };
 pub use fonts::{

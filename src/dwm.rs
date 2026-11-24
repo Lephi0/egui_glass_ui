@@ -954,6 +954,32 @@ pub fn show_window_at_px(
     let _ = (hwnd_raw, pos_px, size_px, always_on_top);
 }
 
+/// Synchronously sets or clears the native Win32 topmost (`WS_EX_TOPMOST`) Z-order on the HWND.
+pub fn set_window_always_on_top(hwnd_raw: Option<isize>, always_on_top: bool) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        let insert_after = if always_on_top {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                insert_after,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (hwnd_raw, always_on_top);
+}
+
 /// Returns `true` when the native window currently has `WS_VISIBLE` set.
 pub fn is_window_visible(hwnd_raw: Option<isize>) -> bool {
     #[cfg(windows)]
